@@ -20,9 +20,11 @@
 //Direct3D
 #include <d3d12.h>
 #include <DXGI1_6.h>
-
+#include <d3dcompiler.h>
 //DXGI
 #include <dxgidebug.h>
+//DXC
+#include <dxcapi.h>
 
 
 using Microsoft::WRL::ComPtr;
@@ -30,6 +32,8 @@ using Microsoft::WRL::ComPtr;
 
 // DEBUG
 #define DEBUG
+#define GPU_BASED_VALIDATION
+
 
 #if defined(DEBUG)
 UINT factoryDebug = DXGI_CREATE_FACTORY_DEBUG;
@@ -44,6 +48,7 @@ ComPtr<ID3D12InfoQueue> directDebugQueue;
 #define HANDLE_RETURN(err) LogIfFailed(err, __FILE__, __LINE__)
 std::stringstream Win32ErrorLog;
 std::stringstream DirectErrorLog;
+std::stringstream HLSLErrorLog;
 inline void LogIfFailed(HRESULT err, const char* file, int line);
 inline void LogIfFailed(bool err, const char* file, int line);
 inline std::string HrToString(HRESULT hr);
@@ -67,13 +72,22 @@ ComPtr<ID3D12DescriptorHeap> backBufferDescriptorHeap;
 ComPtr<ID3D12CommandQueue> cmdQueue;
 ComPtr<IDXGISwapChain3> swapChain;
 
-ComPtr<ID3D12Fence> fence;
-HANDLE presentedEvent;
-UINT64 fenceValues[2] = {};
-UINT64 fenceValue = 0;
+ComPtr<ID3D12Fence> swapChainFence;
+HANDLE swapChainPresentedEvent;
+UINT64 swapChainFenceValues[2] = {};
+UINT64 swapChainFenceValue = 0;
 int activeBuffer = 0;
 
 ComPtr<ID3D12Device2> device;
+
+//Triangle Globals
+ComPtr<ID3D12PipelineState> PSO;
+ComPtr<ID3D12RootSignature> rootSignature;
+D3D12_VERTEX_BUFFER_VIEW vertexBufferView = {};
+D3D12_VIEWPORT viewportDescription = {};
+D3D12_RECT scissorRec = {};
+
+
 
 //Message Procedure
 LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -84,11 +98,25 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_PAINT:
-            ++fenceValue;
+            ++swapChainFenceValue;
 
             allocators[activeBuffer]->Reset();
             cmdList->Reset(allocators[activeBuffer].Get(), NULL);
 
+
+            cmdList->SetPipelineState(PSO.Get());
+            cmdList->SetGraphicsRootSignature(rootSignature.Get());
+            //set rest of IA state
+
+            //set rasteriser state
+            cmdList->RSSetViewports(1, &viewportDescription);
+            cmdList->RSSetScissorRects(1, &scissorRec);
+
+            //set output-merger state
+          
+
+            
+            
             //Clear the target
             //By default back buffer resources created in the swap chain are in the state D3D12_RESOURCE_STATE_PRESENT
             //To clear them they must be in the state D3D12_RESOURCE_STATE_RENDER_TARGET 
@@ -98,15 +126,25 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
                 CD3DX12_RESOURCE_BARRIER RTV2Present = CD3DX12_RESOURCE_BARRIER::Transition(backBufferResources[activeBuffer].Get(),
                     D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+
+
                 cmdList->ResourceBarrier(1, &present2RTV);
 
                 auto bufferDescriptorHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(backBufferDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
                     activeBuffer, rtvHeapOffset);
-                float clearColour[] = { 1.0f,0.0f,0.0f,0.0f };
-                cmdList->ClearRenderTargetView(bufferDescriptorHandle, clearColour, 0, NULL);
+
+                cmdList->OMSetRenderTargets(1, &bufferDescriptorHandle, FALSE, nullptr);
+
+                float clearColour[] = { 1.0f,1.0f,1.0f,1.0f };
+                cmdList->ClearRenderTargetView(bufferDescriptorHandle, clearColour, 0, NULL); //clear rtv        
+
+                cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                cmdList->IASetVertexBuffers(0, 1, &vertexBufferView);
+
+                cmdList->DrawInstanced(3, 1, 0, 0);
+
                 cmdList->ResourceBarrier(1, &RTV2Present);
             }
-
             cmdList->Close();
 
             {
@@ -116,12 +154,12 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                     (screenTearingEnabled) ? DXGI_PRESENT_ALLOW_TEARING : 0);
             }
 
-            fenceValues[activeBuffer] = fenceValue;
-            cmdQueue->Signal(fence.Get(), fenceValues[activeBuffer]);
+            swapChainFenceValues[activeBuffer] = swapChainFenceValue;
+            cmdQueue->Signal(swapChainFence.Get(), swapChainFenceValues[activeBuffer]);
 
             activeBuffer = swapChain->GetCurrentBackBufferIndex();
-            fence->SetEventOnCompletion(fenceValues[activeBuffer], presentedEvent);
-            WaitForSingleObject(presentedEvent, INFINITE);
+            swapChainFence->SetEventOnCompletion(swapChainFenceValues[activeBuffer], swapChainPresentedEvent);
+            WaitForSingleObject(swapChainPresentedEvent, INFINITE);
 
             break;
         case WM_SIZE:
@@ -143,7 +181,7 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
             for (int i = 0; i < 2; ++i) {
                 backBufferResources[i].Reset();
-                fenceValues[i] = fenceValue;
+                swapChainFenceValues[i] = swapChainFenceValue;
             }
             DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
             swapChain->GetDesc1(&swapChainDesc);
@@ -156,6 +194,8 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 swapChain->GetBuffer(i, IID_PPV_ARGS(&backBufferResources[i]));
                 device->CreateRenderTargetView(backBufferResources[i].Get(), NULL, heapHandle);
             }
+            clientAreaWidth = newWidth;
+            clientAreaHeight = newHeight;
         }   
 
             break;
@@ -205,6 +245,33 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProc(hWnd, uMsg, wParam, lParam);
     return 0;
 }
+ComPtr<IDxcBlob> dxcRunTimeCompile(std::wstring shaderPath, std::vector<LPCWSTR> arguments) {
+    //Compile Shaders
+    ComPtr<IDxcUtils> dxcUtil;
+    ComPtr<IDxcBlobEncoding> uncompiledBlob;
+    HANDLE_RETURN(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtil)));
+    UINT32 shaderPage = CP_UTF8;
+    HANDLE_RETURN(dxcUtil->LoadFile(shaderPath.c_str(), &shaderPage, &uncompiledBlob));
+    DxcBuffer uncompiledBuffer = { uncompiledBlob->GetBufferPointer(),uncompiledBlob->GetBufferSize(),shaderPage };
+
+    ComPtr<IDxcCompiler3> dxcCompiler;
+    DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+
+    ComPtr<IDxcResult> result;
+    dxcCompiler->Compile(&uncompiledBuffer, arguments.data(), (UINT32)arguments.size(), nullptr, IID_PPV_ARGS(&result));
+
+    ComPtr<IDxcBlob> compiledBlob;
+    result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&compiledBlob), nullptr);
+
+    ComPtr<IDxcBlobUtf8> pErrors;
+    result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(pErrors.GetAddressOf()), nullptr);
+    if (pErrors && pErrors->GetStringLength() > 0)
+    {
+        HLSLErrorLog << (char*)pErrors->GetBufferPointer();
+    }
+    return compiledBlob;
+}
+
 
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine, int nCmdShow)
@@ -261,28 +328,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
 
     //Create the D3D12 Debug layer
 #if defined(DEBUG)
-    ComPtr<ID3D12Debug> debugLayer;
-    HANDLE_RETURN(D3D12GetDebugInterface(IID_PPV_ARGS(&debugLayer)));
-    debugLayer->EnableDebugLayer();
+    ComPtr<ID3D12Debug> debugController0;
+    HANDLE_RETURN(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController0)));
+    debugController0->EnableDebugLayer();
+#if defined(GPU_BASED_VALIDATION)
 
+    ComPtr<ID3D12Debug1> debugController1;
+    debugController0.As(&debugController1);
+    debugController1->SetEnableGPUBasedValidation(TRUE);
+
+#endif //GPU_BASED_VALIDATION
     //DXGI info queue
     if (SUCCEEDED(DXGIGetDebugInterface1(NULL, IID_PPV_ARGS(&dxgiInfoQueue)))) {
         dxgiInfoQueue->SetBreakOnSeverity(DXGI_DEBUG_DX, DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION, TRUE);
 
         //Create filter
         DXGI_INFO_QUEUE_FILTER_DESC dxgiFilterDesc = {};
-        DXGI_INFO_QUEUE_MESSAGE_SEVERITY dxgiAllowedSeverity[] = { DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION,DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR };
-        dxgiFilterDesc.NumSeverities = 2;
+        DXGI_INFO_QUEUE_MESSAGE_SEVERITY dxgiAllowedSeverity[] = { DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION,DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR,DXGI_INFO_QUEUE_MESSAGE_SEVERITY_WARNING };
+        dxgiFilterDesc.NumSeverities = 3;
         dxgiFilterDesc.pSeverityList = dxgiAllowedSeverity;
         DXGI_INFO_QUEUE_FILTER dxgiFilter = {};
         dxgiFilter.AllowList = { dxgiFilterDesc };
-        dxgiInfoQueue->PushStorageFilter(DXGI_DEBUG_DX,&dxgiFilter);
+        dxgiInfoQueue->PushStorageFilter(DXGI_DEBUG_DX, &dxgiFilter);
     }
 
 #endif //DEBUG
 
     //Choose adapter
-
     ComPtr<IDXGIFactory4> factory;
     HANDLE_RETURN(CreateDXGIFactory2(factoryDebug, IID_PPV_ARGS(&factory)));
 
@@ -315,8 +387,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
         directDebugQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
         //create filter
         D3D12_INFO_QUEUE_FILTER_DESC filterDesc= {};
-        D3D12_MESSAGE_SEVERITY allowedMessages[] = {D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR};
-        filterDesc.NumSeverities = 2;
+        D3D12_MESSAGE_SEVERITY allowedMessages[] = {D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR, D3D12_MESSAGE_SEVERITY_WARNING};
+        filterDesc.NumSeverities = 3;
         filterDesc.pSeverityList = allowedMessages;
         D3D12_INFO_QUEUE_FILTER filter = { filterDesc };
         directDebugQueue->PushStorageFilter(&filter);
@@ -386,14 +458,179 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
     cmdList->Close();
    
     //Create fence and win32 event for synchronisation
-    HANDLE_RETURN(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
-    presentedEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    HANDLE_RETURN(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&swapChainFence)));
+    swapChainPresentedEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+   
 
 
-    d3dInit = true;
+    //Transfer data to VRAM
+    ComPtr<ID3D12Resource> vertices;
+    float data[] = { 
+              -0.5f, -0.5f,  // Vertex 2
+                0.0f,  0.5f,  // Vertex 3
+               0.5f, -0.5f }; // Vertex 1
+    
+        ComPtr<ID3D12Resource> vertexStagingBuffer;
+        D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(data), D3D12_RESOURCE_FLAG_NONE);
+
+        HANDLE_RETURN(device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
+            &resourceDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vertices)));
+
+        HANDLE_RETURN(device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
+            &resourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vertexStagingBuffer)));
+
+
+        D3D12_SUBRESOURCE_DATA dataSubResource = {};
+        dataSubResource.pData = (void*)data;
+        dataSubResource.RowPitch = sizeof(data);
+        dataSubResource.SlicePitch = dataSubResource.RowPitch;
+
+        D3D12_SUBRESOURCE_DATA subResources[] = { dataSubResource };
+
+
+        cmdList->Reset(allocators[activeBuffer].Get(), NULL);
+        UpdateSubresources(cmdList.Get(), vertices.Get(), vertexStagingBuffer.Get(), 0, 0, 1, subResources); //helper funcitons adds cmds for COPY
+        cmdList->Close();
+
+        //Execute Command queue
+        ID3D12CommandList* lists[] = { cmdList.Get() };
+        cmdQueue->ExecuteCommandLists(1, lists);
+
+        //Flush GPU 
+        ComPtr<ID3D12Fence> fence;
+        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        HANDLE event = CreateEvent(NULL, FALSE, FALSE, NULL);
+        cmdQueue->Signal(fence.Get(), 1);
+        fence->SetEventOnCompletion(1, event);
+        WaitForSingleObject(event, INFINITE);
+    
+    
+    //Create vertex buffer view
+    vertexBufferView.BufferLocation = vertices->GetGPUVirtualAddress();
+    vertexBufferView.SizeInBytes = sizeof(data);
+    vertexBufferView.StrideInBytes = sizeof(float) * 2;
+
+    //Compile HLSL into DXIL
+    ComPtr<IDxcBlob> vertexShaderBlob = dxcRunTimeCompile(L"shaders/vertexShader.hlsl", { L"-T vs_6_0" });
+    ComPtr<IDxcBlob> pixelShaderBlob = dxcRunTimeCompile(L"shaders/fragmentShader.hlsl", { L"-T ps_6_0" });
+
     
 
+    //Setup for Rasteriser state
+    
+    //Viewport
+    viewportDescription.TopLeftX = 0;
+    viewportDescription.TopLeftY = 0;
+    viewportDescription.Width= clientAreaWidth;
+    viewportDescription.Height= clientAreaHeight;
+    viewportDescription.MinDepth = D3D12_MIN_DEPTH;
+    viewportDescription.MaxDepth= D3D12_MAX_DEPTH;
+
+    //Scissor Rectangle
+    scissorRec.top = 0;
+    scissorRec.left= 0;
+    scissorRec.bottom = LONG_MAX;
+    scissorRec.right= LONG_MAX;
+
+
+
+    //PSO
+
+    //Input layout
+    D3D12_INPUT_ELEMENT_DESC vertexPositionLayoutDescription = {};
+    vertexPositionLayoutDescription.SemanticName = "POSITION";
+    vertexPositionLayoutDescription.SemanticIndex= 0;
+    vertexPositionLayoutDescription.Format= DXGI_FORMAT_R32G32_FLOAT;
+    vertexPositionLayoutDescription.InputSlot= 0;
+    vertexPositionLayoutDescription.AlignedByteOffset= D3D12_APPEND_ALIGNED_ELEMENT;
+    vertexPositionLayoutDescription.InputSlotClass  = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    vertexPositionLayoutDescription.InstanceDataStepRate = 0;
+
+    D3D12_INPUT_LAYOUT_DESC layoutDescription = { &vertexPositionLayoutDescription,1 };
+
+    //Render Target View format
+    D3D12_RT_FORMAT_ARRAY rtvFormat;
+    rtvFormat.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    std::fill(&rtvFormat.RTFormats[1], &rtvFormat.RTFormats[8], DXGI_FORMAT_UNKNOWN);
+    rtvFormat.NumRenderTargets = 1;
+
+
+    //Create Root signature using run-time seralisaiton
+    D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags = (D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | 
+                                                     D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | 
+                                                     D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+                                                     D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+                                                     D3D12_ROOT_SIGNATURE_FLAG_DENY_MESH_SHADER_ROOT_ACCESS |
+                                                     D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS
+                                                     );
+
+    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDescription = {};
+    rootSignatureDescription.Init_1_1(0, nullptr, 0, nullptr, rootSignatureFlags);
+    
+    ComPtr<ID3DBlob> seralisedRootSignature;
+    ComPtr<ID3DBlob> seralisedRootSignatureErrors;
+
+    //Check shader model feature support
+    D3D12_FEATURE_DATA_ROOT_SIGNATURE rootSignatureFeatureLevel = {};
+    rootSignatureFeatureLevel.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &rootSignatureFeatureLevel, sizeof(rootSignatureFeatureLevel))))
+    {
+        rootSignatureFeatureLevel.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0; //if for some reason the feature check fails, set it to version 1.1
+    }
+
+
+
+    D3DX12SerializeVersionedRootSignature(&rootSignatureDescription, rootSignatureFeatureLevel.HighestVersion, &seralisedRootSignature, &seralisedRootSignatureErrors);
+
+
+    if (seralisedRootSignatureErrors) {
+        HLSLErrorLog << (char*)seralisedRootSignatureErrors->GetBufferPointer();
+    }
+
+    device->CreateRootSignature(0, seralisedRootSignature->GetBufferPointer(), seralisedRootSignature->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
+
+
+    //Create PSO
+    struct StateStream {
+        CD3DX12_PIPELINE_STATE_STREAM_VS vs;
+        CD3DX12_PIPELINE_STATE_STREAM_PS ps;
+        CD3DX12_PIPELINE_STATE_STREAM_PRIMITIVE_TOPOLOGY primitive;
+        CD3DX12_PIPELINE_STATE_STREAM_INPUT_LAYOUT inputLayout;
+        CD3DX12_PIPELINE_STATE_STREAM_RENDER_TARGET_FORMATS targetFormat;
+        CD3DX12_PIPELINE_STATE_STREAM_ROOT_SIGNATURE rootSig;
+    };
+
+    StateStream stream;
+    stream.vs = CD3DX12_PIPELINE_STATE_STREAM_VS(CD3DX12_SHADER_BYTECODE(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize()));
+    stream.ps = CD3DX12_PIPELINE_STATE_STREAM_PS(CD3DX12_SHADER_BYTECODE(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize()));
+    stream.inputLayout = CD3DX12_PIPELINE_STATE_STREAM_INPUT_LAYOUT(layoutDescription);
+    stream.primitive = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    stream.targetFormat = rtvFormat;
+    stream.rootSig = rootSignature.Get();
+
+    D3D12_PIPELINE_STATE_STREAM_DESC pipelineStateStream{};
+    pipelineStateStream.pPipelineStateSubobjectStream = &stream;
+    pipelineStateStream.SizeInBytes = sizeof(StateStream);
+    HANDLE_RETURN(device->CreatePipelineState(&pipelineStateStream, IID_PPV_ARGS(&PSO)));
+
+
+
+    
+  
+
+    
+    d3dInit = true;
+  
+
+
+
+
     ShowWindow(windowHandle, SW_SHOW);
+
+
+
+
 
     //Message Loop
     MSG windowMsg= {};
@@ -419,6 +656,9 @@ void logDebug() {
     if (!DirectErrorLog.str().empty()) {
         displayErrorMessage("DX12 Errors:\n\n" + DirectErrorLog.str());
     }
+    if (!HLSLErrorLog.str().empty()) {
+        displayErrorMessage("HLSL Errors:\n\n" + HLSLErrorLog.str());
+    }
 
 #if defined(DEBUG)
     //DXGI
@@ -429,7 +669,8 @@ void logDebug() {
             dxgiInfoQueue->GetMessage(DXGI_DEBUG_DX, i, nullptr, &messageSize);
             DXGI_INFO_QUEUE_MESSAGE* msg = (DXGI_INFO_QUEUE_MESSAGE*)malloc(messageSize);
             dxgiInfoQueue->GetMessage(DXGI_DEBUG_DX, i, msg, &messageSize);
-            displayErrorMessage("DXGI Error:\n\n" + std::string(msg->pDescription));
+            if(msg)
+                displayErrorMessage("DXGI Error:\n\n" + std::string(msg->pDescription));
         }
     }
 
@@ -441,7 +682,8 @@ void logDebug() {
             directDebugQueue->GetMessage(i, nullptr, &messageSize);
             D3D12_MESSAGE* msg = (D3D12_MESSAGE*)malloc(messageSize);
             directDebugQueue->GetMessage(i, msg, &messageSize);
-            displayErrorMessage("D3D Errors:\n\n" + std::string(msg->pDescription));
+            if(msg)
+                displayErrorMessage("D3D Errors:\n\n" + std::string(msg->pDescription));
         }
     }
 #endif //DEBUG
