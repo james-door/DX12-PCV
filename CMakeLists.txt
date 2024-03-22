@@ -18,6 +18,18 @@ add_executable (Window WIN32 ${SOURCE_FILES}) #Make a Windows GUI application
 
 
 
+option(USE_UNICODE "Support Unicode." OFF)
+if(USE_UNICODE)
+	target_compile_definitions(Window PUBLIC UNICODE) 
+	target_compile_definitions(Window PUBLIC _UNICODE) 
+endif()
+
+
+option(USE_DEBUG_LAYER "Toggles use of DXGI and Direct3D debug layers." OFF)
+if(USE_DEBUG_LAYER)
+	target_compile_definitions(Window PUBLIC DEBUG) 
+endif()
+
 
 option(USE_RUNTIME_SHADER_COMPILING "Whether to include the dxcompiler.dll." OFF)
 
@@ -61,10 +73,4 @@ target_link_libraries(Window ${LIBRARIES})
 
 target_include_directories(Window PRIVATE ${PROJECT_BINARY_DIR})
 
-
-option(USE_UNICODE "Support Unicode." OFF)
-if(USE_UNICODE)
-	target_compile_definitions(Window PUBLIC UNICODE) 
-	target_compile_definitions(Window PUBLIC _UNICODE) 
-endif()
 
