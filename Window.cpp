@@ -15,13 +15,14 @@
 #include <thread>
 // Helper headers 
 #include "d3dx12.h" 
-
+#include "PointCloudRenderer.h"
+#include "debug.h"
 //DirectX 12
 #include <DirectXColors.h>
 //Direct3D
 #include <d3d12.h>
 #include <DXGI1_6.h>
-#include <d3dcompiler.h>
+//#include <d3dcompiler.h>
 //DXGI
 #include <dxgidebug.h>
 //DXC
@@ -31,7 +32,6 @@
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
-
 
 // DEBUG
 //#define GPU_BASED_VALIDATION
@@ -46,26 +46,16 @@ UINT factoryDebug = 0;
 #endif //DEBUG
 
 
-#define HANDLE_RETURN(err) LogIfFailed(err, __FILE__, __LINE__)
-std::stringstream Win32ErrorLog;
-std::stringstream DirectErrorLog;
-std::stringstream HLSLErrorLog;
-inline void LogIfFailed(HRESULT err, const char* file, int line);
-inline void LogIfFailed(bool err, const char* file, int line);
-inline std::string HrToString(HRESULT hr);
-void displayErrorMessage(std::string error);
-void logDebug();
-
 
 //Globals
 LONG clientAreaWidth;
 LONG clientAreaHeight;
+ComPtr<ID3D12CommandAllocator> allocators[2];
 
 bool d3dInit = false;
 bool screenTearingEnabled = true;
 bool fsbw= false;
 RECT previousClientArea;
-ComPtr<ID3D12CommandAllocator> allocators[2];
 ComPtr<ID3D12GraphicsCommandList> cmdList;
 ComPtr<ID3D12Resource> backBufferResources[2];
 UINT rtvHeapOffset;
@@ -101,11 +91,51 @@ int oldMousePosX = 0.0f;
 int oldMousePosY = 0.0f;
 bool leftMouseButtonHeld = false;
 bool firstMove = true;
-XMMATRIX projectionMatrix = XMMatrixPerspectiveFovLH(XMConvertToRadians(FOV), 16.0f / 9.0f, 0.1, 100);
-XMMATRIX viewMatrix = XMMatrixIdentity();
-XMMATRIX modelMatrix = XMMatrixIdentity();
+XMMATRIX projectionMatrix;
+XMMATRIX viewMatrix;
+XMMATRIX modelMatrix;
+std::chrono::steady_clock::time_point previousFrameTime;
+std::chrono::duration<float, std::ratio<1, 1>> deltaTime;
 
+//Temporary
+struct ViewingSphere
+{
+    XMFLOAT3 centroid;
+    float radius;
+};
+ViewingSphere viewingSphere;
+void uploadDepthStencilBufferAndCreateView();
+ComPtr<ID3D12Resource> dsvResource;
 
+void onUpdate()
+{
+    auto currentFrameTime = std::chrono::steady_clock::now();
+    deltaTime = currentFrameTime - previousFrameTime;
+    previousFrameTime = currentFrameTime;
+    
+
+    //Update Model matrix
+    modelMatrix = XMMatrixIdentity();
+
+    //Update View matrix
+    float radius = viewingSphere.radius * 2.0f;
+    float theta = XMConvertToRadians(pitch + 90);
+    float phi = XMConvertToRadians(yaw); // Adjusted to ensure phi is calculated correctly
+
+    // Spherical to Cartesian conversion for camera position
+    float x = radius * XMScalarSin(theta) * XMScalarCos(phi);
+    float z = radius * XMScalarSin(theta) * XMScalarSin(phi);
+    float y = radius * XMScalarCos(theta);
+    XMVECTOR cameraPos = XMVectorSet(viewingSphere.centroid.x + x, viewingSphere.centroid.y + y, viewingSphere.centroid.z + z, 1.0f);
+    XMVECTOR target = XMVectorSet(viewingSphere.centroid.x, viewingSphere.centroid.y, viewingSphere.centroid.z, 1.0f);
+    XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 1.0f);
+    viewMatrix = XMMatrixLookAtLH(cameraPos, target, up);
+
+    //Update Projection matrix
+    float aspectRatio = static_cast<float>(clientAreaWidth) / static_cast<float>(clientAreaHeight);
+    projectionMatrix = XMMatrixPerspectiveFovLH(XMConvertToRadians(FOV), aspectRatio, 0.1, 100);
+
+}
 //Message Procedure
 LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (d3dInit) {
@@ -115,13 +145,13 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_PAINT:
+            onUpdate();
             ++swapChainFenceValue;
             allocators[activeBuffer]->Reset();
             cmdList->Reset(allocators[activeBuffer].Get(), NULL);
 
             cmdList->SetPipelineState(PSO.Get());
             cmdList->SetGraphicsRootSignature(rootSignature.Get());
-            //set rest of IA state
 
             //set rasteriser state
             cmdList->RSSetViewports(1, &viewportDescription);
@@ -158,9 +188,8 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
                 cmdList->IASetVertexBuffers(0, 1, &vertexBufferView);
 
-                //Set the root parameter
-                //MVP
-           
+                //Update MVP every frame
+
                 MVP = XMMatrixMultiply(XMMatrixMultiply(modelMatrix, viewMatrix), projectionMatrix);
 
                 cmdList->SetGraphicsRoot32BitConstants(0, sizeof(MVP) / 4, &MVP, 0);
@@ -197,7 +226,7 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                 break;
 
 
-            //Flush GPU
+            //Flush GPU to avoid changing in-flight buffer
             ComPtr<ID3D12Fence> flush;
             device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&flush));
             cmdQueue->Signal(flush.Get(), 1);
@@ -226,6 +255,7 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
             clientAreaWidth = newWidth;
             clientAreaHeight = newHeight;
+            uploadDepthStencilBufferAndCreateView();
         }
 
         break;
@@ -280,13 +310,16 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
                     oldMousePosY = newMousePosY;
                     firstMove = false;
                 }
-                yaw += (oldMousePosX - newMousePosX) * 0.5;
-                pitch += (oldMousePosY - newMousePosY) * 0.5;
+                constexpr float mouseSensitivity = 1000.0f;
+                yaw += (oldMousePosX - newMousePosX) * deltaTime.count() * mouseSensitivity;
+                pitch += (oldMousePosY - newMousePosY) * deltaTime.count() * mouseSensitivity;
                 oldMousePosX = newMousePosX;
                 oldMousePosY = newMousePosY;
-                XMMATRIX pitchYawRotation = XMMatrixMultiply(XMMatrixRotationX(XMConvertToRadians(pitch)), XMMatrixRotationY(XMConvertToRadians(yaw)));
-                modelMatrix = pitchYawRotation;
-                
+
+                yaw = std::max(-180.0f, std::min(180.0f, yaw));
+                pitch = std::max(-89.0f, std::min(89.0f, pitch));
+
+                 
             }
             break;
         case WM_LBUTTONDOWN:
@@ -300,13 +333,16 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             break;
         case WM_MOUSEWHEEL:
             {
+            constexpr float maximumFOV = 90.0f;
+            constexpr float minimumFOV= 1.0f;
+            constexpr float deltaFOV= 1.0f;
                 short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
                 if (zDelta < 0)
-                    FOV = std::min(45.0f, FOV + 1.0f);
+                    FOV = std::min(maximumFOV, FOV + deltaFOV);
                 else
-                    FOV = std::max(1.0f, FOV - 1.0f);
-                projectionMatrix = XMMatrixPerspectiveFovLH(XMConvertToRadians(FOV), 16.0f / 9.0f, 0.1, 100);
+                    FOV = std::max(minimumFOV, FOV - deltaFOV);
             }
+
             break;
 
 
@@ -320,40 +356,40 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 }
 
 
-ComPtr<IDxcBlob> dxcRuntimeCompile(std::wstring shaderPath, std::vector<LPCWSTR> arguments) {
-    //Compile Shaders
-    ComPtr<IDxcUtils> dxcUtil;
-    ComPtr<IDxcBlobEncoding> uncompiledBlob;
-    HANDLE_RETURN(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtil)));
-    UINT32 shaderPage = CP_UTF8;
-    HANDLE_RETURN(dxcUtil->LoadFile(shaderPath.c_str(), &shaderPage, &uncompiledBlob));
-    DxcBuffer uncompiledBuffer = { uncompiledBlob->GetBufferPointer(),uncompiledBlob->GetBufferSize(),shaderPage };
-
-    ComPtr<IDxcCompiler3> dxcCompiler;
-    DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
-
-    ComPtr<IDxcResult> result;
-    dxcCompiler->Compile(&uncompiledBuffer, arguments.data(), (UINT32)arguments.size(), nullptr, IID_PPV_ARGS(&result));
-
-    ComPtr<IDxcBlob> compiledBlob;
-    result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&compiledBlob), nullptr);
-
-    ComPtr<IDxcBlobUtf8> pErrors;
-    result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(pErrors.GetAddressOf()), nullptr);
-    if (pErrors && pErrors->GetStringLength() > 0)
-    {
-        HLSLErrorLog << (char*)pErrors->GetBufferPointer();
-    }
-    return compiledBlob;
-}
-
+//ComPtr<IDxcBlob> dxcRuntimeCompile(std::wstring shaderPath, std::vector<LPCWSTR> arguments) {
+//    //Compile Shaders
+//    ComPtr<IDxcUtils> dxcUtil;
+//    ComPtr<IDxcBlobEncoding> uncompiledBlob;
+//    HANDLE_RETURN(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtil)));
+//    UINT32 shaderPage = CP_UTF8;
+//    HANDLE_RETURN(dxcUtil->LoadFile(shaderPath.c_str(), &shaderPage, &uncompiledBlob));
+//    DxcBuffer uncompiledBuffer = { uncompiledBlob->GetBufferPointer(),uncompiledBlob->GetBufferSize(),shaderPage };
+//
+//    ComPtr<IDxcCompiler3> dxcCompiler;
+//    DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+//
+//    ComPtr<IDxcResult> result;
+//    dxcCompiler->Compile(&uncompiledBuffer, arguments.data(), (UINT32)arguments.size(), nullptr, IID_PPV_ARGS(&result));
+//
+//    ComPtr<IDxcBlob> compiledBlob;
+//    result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&compiledBlob), nullptr);
+//
+//    ComPtr<IDxcBlobUtf8> pErrors;
+//    result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(pErrors.GetAddressOf()), nullptr);
+//    if (pErrors && pErrors->GetStringLength() > 0)
+//    {
+//        HLSLErrorLog << (char*)pErrors->GetBufferPointer();
+//    }
+//    return compiledBlob;
+//}
+//
 
 
 struct vertex {
-    XMFLOAT3 ndcPos;
+    XMFLOAT3 modelPos;
     XMFLOAT3 colour;
     vertex(const XMFLOAT3& pos, const XMFLOAT3& col)
-        : ndcPos(pos), colour(col) {}
+        : modelPos(pos), colour(col) {}
 };
 
 //ToDo: Estimate the number of points based on the file size, instead of using push_back
@@ -376,9 +412,9 @@ void processPointCloudChunckASC(const std::string &chunk, std::vector<vertex>&ve
     }
 }
 
-std::optional<std::vector<vertex>> readPointCloudASC()
+std::optional<std::vector<vertex>> readPointCloudASC(std::string path)
 {
-    std::filesystem::path objPath = "cube.asc";
+    std::filesystem::path objPath = path;
     if(!std::filesystem::exists(objPath))
         return std::nullopt;
     std::filesystem::path filePath(objPath);
@@ -436,10 +472,66 @@ std::optional<std::vector<vertex>> readPointCloudASC()
 }
 
 
+ViewingSphere CalculateMinimumBoundingSphere(const std::vector<vertex>& vertices) {
+    //Caclulate centroid
+    XMVECTOR sumPos = XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (const auto& vert : vertices) {
+        XMVECTOR pos = XMLoadFloat3(&vert.modelPos);
+        sumPos = XMVectorAdd(sumPos, pos);
+    }
+
+    sumPos = XMVectorScale(sumPos, 1.0f / vertices.size());
+
+    XMFLOAT3 centroid;
+    XMStoreFloat3(&centroid, sumPos);
+    XMVECTOR centroidVec = XMLoadFloat3(&centroid);
+
+    //Calcualte radius 
+    float maxDistance = 0.0f;
+    for (const auto& vert : vertices) {
+        XMVECTOR pos = XMLoadFloat3(&vert.modelPos);
+        XMVECTOR distance = XMVector3Length(XMVectorSubtract(pos, centroidVec));
+        float distanceValue;
+        XMStoreFloat(&distanceValue,distance);
+        maxDistance = std::max(maxDistance, distanceValue);
+
+    }
+
+
+    return { centroid,maxDistance };
+}
+
+std::optional<std::vector<std::byte>> loadByteCode(std::filesystem::path path)
+{
+    if (!std::filesystem::exists(path))
+        std::nullopt;
+    auto dataSize = std::filesystem::file_size(path);
+    std::vector<std::byte> buffer;
+    buffer.resize(dataSize);
+    std::ifstream in(path, std::ios::binary);
+    in.read(reinterpret_cast<char*>(buffer.data()), dataSize);
+    if (!in.good() && !in.eof())
+        return std::nullopt;
+    return buffer;
+
+}
+
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine, int nCmdShow)
 {
-  
 
+    std::optional<std::vector<vertex>> vertices = readPointCloudASC("cube.asc");
+    if (!vertices.has_value())
+        return 1;
+
+
+    UINT64 bufferSize = sizeof(vertex) * vertices->size();
+    nVerts = vertices->size();
+
+
+    viewingSphere = CalculateMinimumBoundingSphere(vertices.value());
+    //Win32
     //Register a window class
     WNDCLASSEX winClass = {};
     winClass.cbSize = sizeof(WNDCLASSEX);
@@ -525,14 +617,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<IDXGIAdapter1> bestAdapter;
     UINT n = 0;
-    UINT highestVRam = -1;
+    UINT highestVRam = 0;
     //Choose an adapter
     while (factory->EnumAdapters1(n, &adapter) == S_OK)
     {
         DXGI_ADAPTER_DESC1 adapterDesc = {};
         HANDLE_RETURN(adapter->GetDesc1(&adapterDesc));
         if ((adapterDesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0
-            && D3D12CreateDevice(adapter.Get(), featureLevel, __uuidof(ID3D12Device2), NULL) == S_FALSE //Check adaptor feature level is high enough
+            && SUCCEEDED(D3D12CreateDevice(adapter.Get(), featureLevel, __uuidof(ID3D12Device2), nullptr)) //Check adaptor feature level is high enough
             && adapterDesc.DedicatedVideoMemory > highestVRam)
         {
             bestAdapter = adapter;
@@ -627,14 +719,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
 
    
 
-    std::optional<std::vector<vertex>> vertices = readPointCloudASC();
-    if (!vertices.has_value())
-        return 1;
-   
+ 
 
-
-    UINT64 bufferSize = sizeof(vertex) * vertices->size();
-    nVerts = vertices->size();
 
     D3D12_SUBRESOURCE_DATA vertexSubResourceData = {};
     vertexSubResourceData.pData = vertices->data();
@@ -648,12 +734,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
     ComPtr<ID3D12Resource> vertexStagingBufferResource;
     D3D12_RESOURCE_DESC vertexResourceDesc= CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
     
-    device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
-        &vertexResourceDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vertexResource));
+    HANDLE_RETURN(device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE,
+        &vertexResourceDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&vertexResource)));
 
-    device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
-        &vertexResourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vertexStagingBufferResource));
+    HANDLE_RETURN(device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
+        &vertexResourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&vertexStagingBufferResource)));
 
+ 
 
     cmdList->Reset(allocators[activeBuffer].Get(), nullptr);
     UpdateSubresources(cmdList.Get(), vertexResource.Get(), vertexStagingBufferResource.Get(), 0, 0, 1, &vertexSubResourceData);
@@ -672,31 +759,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
     fence->SetEventOnCompletion(1, event);
     WaitForSingleObject(event, INFINITE);
     
-    //Create depth-stencil view
-    //Descriptor Heap
-    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    dsvHeapDesc.NumDescriptors = 1;
-    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    HANDLE_RETURN(device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap)));
-
-    //Create heap and resource for depth-stencil buffer
-    ComPtr<ID3D12Resource> dsvResource;
-    D3D12_RESOURCE_DESC dsvTextureDesc= CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, clientAreaWidth, clientAreaHeight, 1,
-        1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_TEXTURE_LAYOUT_UNKNOWN, 0);
-    D3D12_CLEAR_VALUE dsvTextureClearValue = {};
-    dsvTextureClearValue.Format = DXGI_FORMAT_D32_FLOAT;
-    dsvTextureClearValue.DepthStencil = { 1.0f,0 };
-    HANDLE_RETURN(device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE, &dsvTextureDesc,
-        D3D12_RESOURCE_STATE_DEPTH_WRITE, &dsvTextureClearValue,IID_PPV_ARGS(&dsvResource)));
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
-    dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
-    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
-    dsvDesc.Texture2D = {0};
-    device->CreateDepthStencilView(dsvResource.Get(), &dsvDesc, dsvHeap->GetCPUDescriptorHandleForHeapStart());
-
-
 
 
     //Create vertex buffer view
@@ -706,9 +768,37 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
 
 
 
+    //Create depth-stencil view
+    //Descriptor Heap
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvHeapDesc.NumDescriptors = 1;
+    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    HANDLE_RETURN(device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap)));
+
+    //Create heap and resource for depth-stencil buffer
+    uploadDepthStencilBufferAndCreateView();
+
+
+ 
+
+
     //Compile HLSL into DXIL
-    ComPtr<IDxcBlob> vertexShaderBlob = dxcRuntimeCompile(L"shaders/vertexShader.hlsl", { L"-T vs_6_0" });
-    ComPtr<IDxcBlob> pixelShaderBlob = dxcRuntimeCompile(L"shaders/fragmentShader.hlsl", { L"-T ps_6_0" });
+    
+    //ComPtr<IDxcBlob> vertexShaderBlob = dxcRuntimeCompile(L"shaders/vertexShader.hlsl", { L"-T vs_6_0" });
+    //ComPtr<IDxcBlob> pixelShaderBlob = dxcRuntimeCompile(L"shaders/fragmentShader.hlsl", { L"-T ps_6_0" });
+
+
+  
+
+
+
+    std::optional<std::vector<std::byte>>  vertexShaderByteCode = loadByteCode("vertexShader.dxil");
+    std::optional<std::vector<std::byte>>  pixelShaderByteCode = loadByteCode("fragmentShader.dxil");
+    if (!vertexShaderByteCode.has_value() || !pixelShaderByteCode.has_value())
+        return 1;
+    
+
 
     
 
@@ -783,12 +873,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
     D3DX12SerializeVersionedRootSignature(&rootSignatureDescription, rootSignatureFeatureLevel.HighestVersion, &seralisedRootSignature, &seralisedRootSignatureErrors);
 
 
-    if (seralisedRootSignatureErrors) {
-        HLSLErrorLog << (char*)seralisedRootSignatureErrors->GetBufferPointer();
-    }
-
     device->CreateRootSignature(0, seralisedRootSignature->GetBufferPointer(), seralisedRootSignature->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
-
 
     //Create PSO
     struct StateStream {
@@ -802,34 +887,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
     };
 
     StateStream stream;
-    stream.vs = CD3DX12_PIPELINE_STATE_STREAM_VS(CD3DX12_SHADER_BYTECODE(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize()));
-    stream.ps = CD3DX12_PIPELINE_STATE_STREAM_PS(CD3DX12_SHADER_BYTECODE(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize()));
+    stream.vs = CD3DX12_PIPELINE_STATE_STREAM_VS(CD3DX12_SHADER_BYTECODE(vertexShaderByteCode->data(),vertexShaderByteCode->size()));
+    stream.ps = CD3DX12_PIPELINE_STATE_STREAM_PS(CD3DX12_SHADER_BYTECODE(pixelShaderByteCode->data(),pixelShaderByteCode->size()));
     stream.inputLayout = CD3DX12_PIPELINE_STATE_STREAM_INPUT_LAYOUT(layoutDescription);
     stream.primitive = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
     stream.targetFormat = rtvFormat;
     stream.rootSig = rootSignature.Get();
     stream.dsFormat = DXGI_FORMAT_D32_FLOAT;
 
-   
-
-
-
-
-
     D3D12_PIPELINE_STATE_STREAM_DESC pipelineStateStream{};
     pipelineStateStream.pPipelineStateSubobjectStream = &stream;
     pipelineStateStream.SizeInBytes = sizeof(StateStream);
     HANDLE_RETURN(device->CreatePipelineState(&pipelineStateStream, IID_PPV_ARGS(&PSO)));
 
-    XMMATRIX modelMatrix = XMMatrixIdentity();
-    XMVECTOR cameraPos = XMVectorSet(0.0f, 0.0f, 40.0f, 1.0f);
-    XMVECTOR target = XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f);
-    XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 1.0f);
-    viewMatrix = XMMatrixLookAtLH(cameraPos, target, up);
 
-    MVP = XMMatrixMultiply(XMMatrixMultiply(modelMatrix, viewMatrix), projectionMatrix);
   
-
+    previousFrameTime = std::chrono::steady_clock::now();
 
     d3dInit = true;
   
@@ -851,100 +924,64 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
         DispatchMessage(&windowMsg);
     }
 
-    logDebug();
+//#if defined(DEBUG)
+//    //DXGI
+//    {
+//        UINT64 numMsg = dxgiInfoQueue->GetNumStoredMessages(DXGI_DEBUG_DX);
+//        for (UINT64 i = 0; i < numMsg; ++i) {
+//            SIZE_T messageSize;
+//            dxgiInfoQueue->GetMessage(DXGI_DEBUG_DX, i, nullptr, &messageSize);
+//            DXGI_INFO_QUEUE_MESSAGE* msg = (DXGI_INFO_QUEUE_MESSAGE*)malloc(messageSize);
+//            dxgiInfoQueue->GetMessage(DXGI_DEBUG_DX, i, msg, &messageSize);
+//            if (msg)
+//                displayErrorMessage("DXGI Error:\n\n" + std::string(msg->pDescription));
+//        }
+//    }
+//
+//    //D3D12
+//    {
+//        UINT64 numMsg = directDebugQueue->GetNumStoredMessages();
+//        for (UINT64 i = 0; i < numMsg; ++i) {
+//            SIZE_T messageSize;
+//            directDebugQueue->GetMessage(i, nullptr, &messageSize);
+//            D3D12_MESSAGE* msg = (D3D12_MESSAGE*)malloc(messageSize);
+//            directDebugQueue->GetMessage(i, msg, &messageSize);
+//            if (msg)
+//                displayErrorMessage("D3D Errors:\n\n" + std::string(msg->pDescription));
+//        }
+//    }
+//#endif //DEBUG
 
 
 	return 0;
 }
 
 
-
-void logDebug() {
-    //DX12 info queue
-    if (!Win32ErrorLog.str().empty()) {
-        displayErrorMessage("Win32 Errors:\n\n" + Win32ErrorLog.str());
-    }
-    if (!DirectErrorLog.str().empty()) {
-        displayErrorMessage("DX12 Errors:\n\n" + DirectErrorLog.str());
-    }
-    if (!HLSLErrorLog.str().empty()) {
-        displayErrorMessage("HLSL Errors:\n\n" + HLSLErrorLog.str());
-    }
-
-#if defined(DEBUG)
-    //DXGI
-    {
-        UINT64 numMsg = dxgiInfoQueue->GetNumStoredMessages(DXGI_DEBUG_DX);
-        for (UINT64 i = 0; i < numMsg; ++i) {
-            SIZE_T messageSize;
-            dxgiInfoQueue->GetMessage(DXGI_DEBUG_DX, i, nullptr, &messageSize);
-            DXGI_INFO_QUEUE_MESSAGE* msg = (DXGI_INFO_QUEUE_MESSAGE*)malloc(messageSize);
-            dxgiInfoQueue->GetMessage(DXGI_DEBUG_DX, i, msg, &messageSize);
-            if(msg)
-                displayErrorMessage("DXGI Error:\n\n" + std::string(msg->pDescription));
-        }
-    }
-
-    //D3D12
-    {
-        UINT64 numMsg = directDebugQueue->GetNumStoredMessages();
-        for (UINT64 i = 0; i < numMsg; ++i) {
-            SIZE_T messageSize;
-            directDebugQueue->GetMessage(i, nullptr, &messageSize);
-            D3D12_MESSAGE* msg = (D3D12_MESSAGE*)malloc(messageSize);
-            directDebugQueue->GetMessage(i, msg, &messageSize);
-            if(msg)
-                displayErrorMessage("D3D Errors:\n\n" + std::string(msg->pDescription));
-        }
-    }
-#endif //DEBUG
-}
-
-
-
-
-
-// DEBUG
-inline void LogIfFailed(HRESULT err, const char* file, int line) {
-    if (FAILED(err)) {
-        std::string message = "File: " + std::string(file) + "\n\n" + HrToString(err) + "\n\nLine: " + std::to_string(line);
-        DirectErrorLog << message;
-    }
-}
-
-
-inline void LogIfFailed(bool err, const char* file, int line)
+void uploadDepthStencilBufferAndCreateView()
 {
-    if (err)
-    {
-        DWORD error = GetLastError();
-        LPVOID lpMsgBuf;
-        FormatMessageA(
-            FORMAT_MESSAGE_ALLOCATE_BUFFER |
-            FORMAT_MESSAGE_FROM_SYSTEM |
-            FORMAT_MESSAGE_IGNORE_INSERTS,
-            NULL,
-            error,
-            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            (LPSTR)&lpMsgBuf,
-            0, NULL);
-
-
-        std::string message = "File: " + std::string(file) + "\n\nMessage: " + std::string((char*)lpMsgBuf) + "\n\nLine: " + std::to_string(line);
-        LocalFree(lpMsgBuf);
-
-        Win32ErrorLog << message;
-    }
-}
-
-inline std::string HrToString(HRESULT hr)
-{
-    char s_str[64] = {};
-    sprintf_s(s_str, "HRESULT of 0x%08X", static_cast<UINT>(hr));
-    return std::string(s_str);
-}
-void displayErrorMessage(std::string error) {
-
-    MessageBoxA(NULL, error.c_str(), NULL, MB_OK);
+   
+    D3D12_RESOURCE_DESC dsvTextureDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, clientAreaWidth, clientAreaHeight, 1,
+        1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_TEXTURE_LAYOUT_UNKNOWN, 0);
+    D3D12_CLEAR_VALUE dsvTextureClearValue = {};
+    dsvTextureClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    dsvTextureClearValue.DepthStencil = { 1.0f,0 };
+    HANDLE_RETURN(device->CreateCommittedResource(&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT), D3D12_HEAP_FLAG_NONE, &dsvTextureDesc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE, &dsvTextureClearValue, IID_PPV_ARGS(&dsvResource)));
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    dsvDesc.Texture2D = { 0 };
+    device->CreateDepthStencilView(dsvResource.Get(), &dsvDesc, dsvHeap->GetCPUDescriptorHandleForHeapStart());
 
 }
+
+
+
+
+
+
+
+
+
+

@@ -10,6 +10,7 @@ struct OutputAttributes{
 struct Transform
 {
     matrix mat;
+
 };
 ConstantBuffer<Transform> TransformCB : register(b0);
 
