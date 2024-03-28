@@ -1,0 +1,33 @@
+﻿{
+    "version": 3,
+    "configurePresets": [
+			{
+				"name": "debug",
+				"generator": "Ninja",
+				"binaryDir": "${sourceDir}/out/build/debug",
+				
+				"cacheVariables": {
+				"CMAKE_C_COMPILER": "cl.exe",
+				"CMAKE_CXX_COMPILER": "cl.exe",
+				"CMAKE_BUILD_TYPE": "Debug",
+				"USE_DEBUG_LAYER" : true,
+				"USE_UNICODE" : false,
+				"USE_RUNTIME_SHADER_COMPILING" : true
+				}
+			},
+		  {
+            "name": "release",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/release",
+			
+			"cacheVariables": {
+			"CMAKE_C_COMPILER": "cl.exe",
+			"CMAKE_CXX_COMPILER": "cl.exe",
+            "CMAKE_BUILD_TYPE": "Release",
+			"USE_DEBUG_LAYER" : false,
+            "USE_UNICODE" : true
+          }
+        }
+
+    ]
+}
