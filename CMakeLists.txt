@@ -2,7 +2,6 @@
 
 project ("Window")
 set(CMAKE_CXX_STANDARD 17) #Use C++17
-#set(CMAKE_SYSTEM_VERSION "latest" CACHE STRING "Set to latest installed Windows SDK" FORCE) #Use latest Windows SDK
 
 set(LIBRARIES d3d12.lib dxgi.lib dxguid.lib)
 set(SOURCE_FILES window.cpp PointCloudRenderer.cpp PointCloudRenderer.h debug.h)
@@ -16,19 +15,11 @@ if(USE_UNICODE)
 	target_compile_definitions(Window PUBLIC _UNICODE) 
 endif()
 
-
 option(USE_DEBUG_LAYER "Toggles use of DXGI and Direct3D debug layers." OFF)
 
 if(USE_DEBUG_LAYER)
 	target_compile_definitions(Window PRIVATE DEBUG) 
 endif()
-option(USE_RUNTIME_SHADER_COMPILING "Whether to include the dxcompiler.dll." OFF)
-
-
-
-#dxc -T vs_6_0 -Fo shad.dxil shaders/vertexShader.hlsl
-
-
 
 add_custom_target(compileVertexShader
     COMMAND dxc -T vs_6_0 -Fo ${PROJECT_BINARY_DIR}/vertexShader.dxil shaders/vertexShader.hlsl
@@ -42,7 +33,5 @@ add_custom_target(compileFragmentShader
 	DEPENDS shaders/fragmentShader.hlsl
     COMMENT "Compiling Pixel Shader."
 )
-
-
 
 add_dependencies(Window compileVertexShader compileFragmentShader)
