@@ -1,24 +1,26 @@
 ﻿cmake_minimum_required (VERSION 3.8)
 
-project ("Window")
+project ("PCV")
+
+
 set(CMAKE_CXX_STANDARD 17) #Use C++17
 
 set(LIBRARIES d3d12.lib dxgi.lib dxguid.lib)
-set(SOURCE_FILES window.cpp PointCloudRenderer.cpp PointCloudRenderer.h debug.h)
+set(SOURCE_FILES PointCloudViewer.cpp PointCloudRenderer.cpp PointCloudRenderer.h debug.h)
 
-add_executable(Window WIN32 ${SOURCE_FILES} ) 
-target_link_libraries(Window ${LIBRARIES})
+add_executable(${CMAKE_PROJECT_NAME} WIN32 ${SOURCE_FILES} ) 
+target_link_libraries(${CMAKE_PROJECT_NAME} ${LIBRARIES})
 
 option(USE_UNICODE "Support Unicode." OFF)
 if(USE_UNICODE)
-	target_compile_definitions(Window PUBLIC UNICODE) 
-	target_compile_definitions(Window PUBLIC _UNICODE) 
+	target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC UNICODE) 
+	target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC _UNICODE) 
 endif()
 
 option(USE_DEBUG_LAYER "Toggles use of DXGI and Direct3D debug layers." OFF)
 
 if(USE_DEBUG_LAYER)
-	target_compile_definitions(Window PRIVATE DEBUG) 
+	target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE DEBUG) 
 endif()
 
 add_custom_target(compileVertexShader
@@ -34,4 +36,4 @@ add_custom_target(compileFragmentShader
     COMMENT "Compiling Pixel Shader."
 )
 
-add_dependencies(Window compileVertexShader compileFragmentShader)
+add_dependencies(${CMAKE_PROJECT_NAME} compileVertexShader compileFragmentShader)
