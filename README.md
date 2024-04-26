@@ -1,6 +1,6 @@
 # Point Cloud Viewer
 
-Create a simple point cloud viewer for Windows using DirectX 12.
+A simple point cloud viewer for Windows using DirectX 12.
 
 ## Build
 
