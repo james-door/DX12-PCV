@@ -14,7 +14,7 @@
 #include "debug.h"
 //DirectXMath
 #include<DirectXMath.h>
-
+#include <filesystem>
 
 HWND createWindow(LONG clientAreaWidth, LONG clientAreaHeight, HINSTANCE hInstance, TCHAR* windowName);
 std::unique_ptr<PointCloudRenderer> pcr;
@@ -153,7 +153,7 @@ LRESULT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-void processPointCloudChunckASC(const std::string &chunk, std::vector<PointCloudVertex>&verts)
+void processPointCloudChunkASC(const std::string &chunk, std::vector<PointCloudVertex>&verts)
 {
     verts.reserve(chunk.size()/64); //approximate number of verts
 
@@ -179,7 +179,9 @@ std::unique_ptr<std::vector<PointCloudVertex>> readPointCloudASC(std::string pat
 
     auto size = std::filesystem::file_size(objPath);
     std::ifstream in(filePath, std::ios::binary);
-    unsigned int nThreads = std::thread::hardware_concurrency()/2;
+    unsigned int nThreads = std::min(4U, std::thread::hardware_concurrency());
+    if (nThreads < 0)
+        nThreads = 1;
 
     std::vector<std::vector<PointCloudVertex>> threadVertices(nThreads);
 
@@ -209,7 +211,7 @@ std::unique_ptr<std::vector<PointCloudVertex>> readPointCloudASC(std::string pat
 
     auto start = std::chrono::steady_clock::now();
     for(int i = 0; i < nThreads; ++i)
-        threads.push_back(std::thread(processPointCloudChunckASC,chunks[i],std::ref(threadVertices[i])));
+        threads.push_back(std::thread(processPointCloudChunkASC,chunks[i],std::ref(threadVertices[i])));
 
     for (auto& t : threads) {
         t.join();
@@ -231,6 +233,7 @@ std::unique_ptr<std::vector<PointCloudVertex>> readPointCloudASC(std::string pat
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine, int nCmdShow)
 {
+
     constexpr LONG defaultClientAreaWidth = 960;
     constexpr LONG defaultClientAreaHeight = 540;
     HWND windowHandle = createWindow(defaultClientAreaWidth,defaultClientAreaHeight,hInstance,_T("Point Cloud Viewer"));

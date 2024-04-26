@@ -96,7 +96,6 @@ void PointCloudRenderer::uploadPointCloudDataToGPU(const std::vector<PointCloudV
     //Execute Command queue
     ID3D12CommandList* lists[] = { cmdList.Get() };
     cmdQueue->ExecuteCommandLists(1, lists);
-
     flushGPU();
 
     //Create vertex buffer view
@@ -420,14 +419,13 @@ void PointCloudRenderer::recaculateMVP()
     modelMatrix = XMMatrixIdentity();
     //Update View matrix
     float radius = viewingSphere.radius * 2.0f;
-    float theta = XMConvertToRadians(pitch + 90);
-    float phi = XMConvertToRadians(yaw); // Adjusted to ensure phi is calculated correctly
-    // Spherical to Cartesian conversion for camera position
+    float theta = XMConvertToRadians(pitch + 90.0f);
+    float phi = XMConvertToRadians(yaw); 
     float x = radius * XMScalarSin(theta) * XMScalarCos(phi);
     float z = radius * XMScalarSin(theta) * XMScalarSin(phi);
     float y = radius * XMScalarCos(theta);
-    XMVECTOR cameraPos = XMVectorSet(viewingSphere.centroid.x + x, viewingSphere.centroid.y + y, viewingSphere.centroid.z + z, 1.0f);
-    XMVECTOR target = XMVectorSet(viewingSphere.centroid.x, viewingSphere.centroid.y, viewingSphere.centroid.z, 1.0f);
+    XMVECTOR cameraPos = XMVectorSet(viewingSphere.centre.x + x, viewingSphere.centre.y + y, viewingSphere.centre.z + z, 1.0f);
+    XMVECTOR target = XMVectorSet(viewingSphere.centre.x, viewingSphere.centre.y, viewingSphere.centre.z, 1.0f);
     XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 1.0f);
     viewMatrix = XMMatrixLookAtLH(cameraPos, target, up);
     //Update Projection matrix
@@ -450,9 +448,9 @@ void PointCloudRenderer::CalculateMinimumBoundingSphere(const std::vector<PointC
 
     sumPos = XMVectorScale(sumPos, 1.0f / vertices.size());
 
-    XMFLOAT3 centroid;
-    XMStoreFloat3(&centroid, sumPos);
-    XMVECTOR centroidVec = XMLoadFloat3(&centroid);
+    XMFLOAT3 centre;
+    XMStoreFloat3(&centre, sumPos);
+    XMVECTOR centroidVec = XMLoadFloat3(&centre);
 
     //Calcualte radius 
     float maxDistance = 0.0f;
@@ -465,7 +463,7 @@ void PointCloudRenderer::CalculateMinimumBoundingSphere(const std::vector<PointC
 
     }
 
-    viewingSphere = { centroid,maxDistance };
+    viewingSphere = { centre,maxDistance };
 }
 
 

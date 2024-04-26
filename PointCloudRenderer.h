@@ -69,7 +69,7 @@ class PointCloudRenderer
 	//Point Cloud State
 	struct ViewingSphere
 	{
-		DirectX::XMFLOAT3 centroid;
+		DirectX::XMFLOAT3 centre;
 		float radius;
 	};
 	ViewingSphere viewingSphere;
